@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Thu Mar 15 09:32:04 2018
 
-@author: Ken Huang
-"""
 from docplex.mp.model import Model
 from itertools import product
 import numpy as np
@@ -13,10 +9,7 @@ import json
 
 
 class MMT:
-    '''a Model class that solves the multi-model transportation optimization problem.'''
-
     def __init__(self, framework='DOCPLEX'):
-        # parameters
         self.portSpace = None
         self.dateSpace = None
         self.goods = None
@@ -39,14 +32,14 @@ class MMT:
         self.transitDuty = None
         self.route_num = None
         self.available_routes = None
-        # decision variables
+        # 决策变量
         self.var = None
         self.x = None
         self.var_2 = None
         self.y = None
         self.var_3 = None
         self.z = None
-        # result & solution
+        # 结果 & 方案
         self.xs = None
         self.ys = None
         self.zs = None
@@ -109,7 +102,7 @@ class MMT:
         self.transitDuty = np.ones([self.portSpace, self.portSpace]) * bigM
         self.transitDuty[source, destination] = route['Transit Duty']
 
-        # make the container size of infeasible routes to be small enough, similar to bigM
+        #让不可行的道路的集装箱量尽量小
         self.ctnVol = np.ones([self.portSpace, self.portSpace]) * 0.1
         self.ctnVol[source, destination] = route['Container Size']
         self.ctnVol = self.ctnVol.reshape(self.portSpace, self.portSpace, 1)
@@ -124,11 +117,11 @@ class MMT:
         self.kStartTime = np.array((order['Order Date'] - self.minDate).dt.days)
         self.taxPct = np.array(order['Tax Percentage'])
 
-        # add available route indexes
+        # 增加可行的路径
         self.route_num = route[['Source', 'Destination']].drop_duplicates().shape[0]
         routes = route[['Source', 'Destination']].drop_duplicates().replace(self.indexPort)
         self.available_routes = list(zip(routes['Source'], routes['Destination']))
-        # localization variables of decision variables in the matrix
+     
         var_location = product(self.available_routes, range(self.dateSpace), range(self.goods))
         var_location = [(i[0][0], i[0][1], i[1], i[2]) for i in var_location]
         self.var_location = tuple(zip(*var_location))
@@ -149,54 +142,52 @@ class MMT:
     def cvxpy_build_model(self):
         '''build up the mathematical programming model's objective and constraints using CVXPY framework.'''
 
-        # 4 dimensional binary decision variable matrix
         self.var = cp.Variable(self.route_num * self.dateSpace * self.goods, boolean=True, name='x')
         self.x = np.zeros((self.portSpace, self.portSpace, self.dateSpace, self.goods)).astype('object')
-        self.x[self.var_location] = list(self.var)
-        # 3 dimensional container number matrix
+        self.x[self.var_location] = list(self.var)        # 3 dimensional container number matrix
         self.var_2 = cp.Variable(self.route_num * self.dateSpace, integer=True, name='y')
         self.y = np.zeros((self.portSpace, self.portSpace, self.dateSpace)).astype('object')
         self.y[self.var_2_location] = list(self.var_2)
-        # 3 dimensional route usage matrix
+ 
         self.var_3 = cp.Variable(self.route_num * self.dateSpace, boolean=True, name='z')
         self.z = np.zeros((self.portSpace, self.portSpace, self.dateSpace)).astype('object')
         self.z[self.var_3_location] = list(self.var_3)
-        # warehouse related cost
+        # 仓储有关成本
         warehouseCost, arrTime, stayTime = self.warehouse_fee(self.x)
-        ###objective###
+       
         transportCost = np.sum(self.y * self.tranCost) + np.sum(self.z * self.tranFixedCost)
         transitDutyCost = np.sum(np.sum(np.dot(self.x, self.kValue), axis=2) * self.transitDuty)
         taxCost = np.sum(self.taxPct * self.kValue) + transitDutyCost
         objective = cp.Minimize(transportCost + warehouseCost + taxCost)
         ###constraint###
         constraints = []
-        # 1.Goods must be shipped out from its origin to another node and shipped to its destination.
+        # 1.货物必须从他的起点到终点并且无折返
         constraints += [np.sum(self.x[self.kStartPort[k], :, :, k]) == 1 for k in range(self.goods)]
         constraints += [np.sum(self.x[:, self.kEndPort[k], :, k]) == 1 for k in range(self.goods)]
-        # 2.For each goods k, it couldn't be shipped out from its destination or shipped to its origin.
+        # 2.每个货物不能从终点开始出发或者运到起点
         constraints += [np.sum(self.x[:, self.kStartPort[k], :, k]) == 0 for k in range(self.goods)]
         constraints += [np.sum(self.x[self.kEndPort[k], :, :, k]) == 0 for k in range(self.goods)]
-        # 3.constraint for transition point
+        # 3.运输限制
         for k in range(self.goods):
             for j in range(self.portSpace):
                 if (j != self.kStartPort[k]) & (j != self.kEndPort[k]):
                     constraints.append(np.sum(self.x[:, j, :, k]) == np.sum(self.x[j, :, :, k]))
-        # 4.each goods can only be transitioned in or out of a port for at most once
+        # 4.每个货物只能经过同一个中转一次
         constraints += [np.sum(self.x[i, :, :, k]) <= 1 for k in range(self.goods) for i in range(self.portSpace)]
         constraints += [np.sum(self.x[:, j, :, k]) <= 1 for k in range(self.goods) for j in range(self.portSpace)]
-        # 5.transition-out should be after transition-in
+        # 5.货物送达以后才能进行下一步运输
         constraints += [stayTime[j, k] >= 0 for j in range(self.portSpace) for k in range(self.goods)]
-        # 6.constraint for number of containers used
+        # 6.集装箱数量限制
         numCtn = np.dot(self.x, self.kVol) / self.ctnVol
         constraints += [self.y[i, j, t] - numCtn[i, j, t] >= 0 \
                         for i in range(self.portSpace) for j in range(self.portSpace) for t in
                         range(self.dateSpace) if not isinstance(self.y[i, j, t] - numCtn[i, j, t] >= 0, bool)]
-        # 7. constraint to check whether a route is used
+        # 7. 检查路径是否已经使用的限制
         constraints += [self.z[i, j, t] >= (np.sum(self.x[i, j, t, :]) * 10e-5) \
                         for i in range(self.portSpace) for j in range(self.portSpace) for t in
                         range(self.dateSpace) if
                         not isinstance(self.z[i, j, t] >= (np.sum(self.x[i, j, t, :]) * 10e-5), bool)]
-        # 8.time limitation constraint for each goods
+        # 8.货物的运输时间限制
         constraints += [np.sum(arrTime[:, self.kEndPort[k], :, k]) <= self.kDDL[k] for k in range(self.goods)
                         if not isinstance(np.sum(arrTime[:, self.kEndPort[k], :, k]) <= self.kDDL[k], bool)]
         model = cp.Problem(objective, constraints)
@@ -208,53 +199,51 @@ class MMT:
     def cplex_build_model(self):
         '''build up the mathematical programming model's objective and constraints using DOCPLEX framework.'''
         model = Model()
-        # 4 dimensional binary decision variable matrix
+   
         self.var = model.binary_var_list(self.route_num * self.dateSpace * self.goods, name='x')
         self.x = np.zeros((self.portSpace, self.portSpace, self.dateSpace, self.goods)).astype('object')
         self.x[self.var_location] = self.var
-        # 3 dimensional container number matrix
+
         self.var_2 = model.integer_var_list(self.route_num * self.dateSpace, name='y')
         self.y = np.zeros((self.portSpace, self.portSpace, self.dateSpace)).astype('object')
         self.y[self.var_2_location] = self.var_2
-        # 3 dimensional route usage matrix
+ 
         self.var_3 = model.binary_var_list(self.route_num * self.dateSpace, name='z')
         self.z = np.zeros((self.portSpace, self.portSpace, self.dateSpace)).astype('object')
         self.z[self.var_3_location] = self.var_3
-        # warehouse related cost
+        # 仓储相关成本
         warehouseCost, arrTime, stayTime = self.warehouse_fee(self.x)
-        ###objective###
+        
         transportCost = np.sum(self.y * self.tranCost) + np.sum(self.z * self.tranFixedCost)
         transitDutyCost = np.sum(np.sum(np.dot(self.x, self.kValue), axis=2) * self.transitDuty)
         taxCost = np.sum(self.taxPct * self.kValue) + transitDutyCost
         model.minimize(transportCost + warehouseCost + taxCost)
-        ###constraint###
-        # 1.Goods must be shipped out from its origin to another node and shipped to its destination.
+
         model.add_constraints(np.sum(self.x[self.kStartPort[k], :, :, k]) == 1 for k in range(self.goods))
         model.add_constraints(np.sum(self.x[:, self.kEndPort[k], :, k]) == 1 for k in range(self.goods))
-        # 2.For each goods k, it couldn't be shipped out from its destination or shipped to its origin.
         model.add_constraints(np.sum(self.x[:, self.kStartPort[k], :, k]) == 0 for k in range(self.goods))
         model.add_constraints(np.sum(self.x[self.kEndPort[k], :, :, k]) == 0 for k in range(self.goods))
-        # 3.constraint for transition point
+ 
         for k in range(self.goods):
             for j in range(self.portSpace):
                 if (j != self.kStartPort[k]) & (j != self.kEndPort[k]):
                     model.add_constraint(np.sum(self.x[:, j, :, k]) == np.sum(self.x[j, :, :, k]))
-        # 4.each goods can only be transitioned in or out of a port for at most once
+       
         model.add_constraints(np.sum(self.x[i, :, :, k]) <= 1 for k in range(self.goods) for i in range(self.portSpace))
         model.add_constraints(np.sum(self.x[:, j, :, k]) <= 1 for k in range(self.goods) for j in range(self.portSpace))
-        # 5.transition-out should be after transition-in
+       
         model.add_constraints(stayTime[j, k] >= 0 for j in range(self.portSpace) for k in range(self.goods))
-        # 6.constraint for number of containers used
+      
         numCtn = np.dot(self.x, self.kVol) / self.ctnVol
         model.add_constraints(self.y[i, j, t] - numCtn[i, j, t] >= 0 \
                               for i in range(self.portSpace) for j in range(self.portSpace) for t in
                               range(self.dateSpace) if not isinstance(self.y[i, j, t] - numCtn[i, j, t] >= 0, bool))
-        # 7. constraint to check whether a route is used
+     
         model.add_constraints(self.z[i, j, t] >= (np.sum(self.x[i, j, t, :]) * 10e-5) \
                               for i in range(self.portSpace) for j in range(self.portSpace) for t in
                               range(self.dateSpace) if
                               not isinstance(self.z[i, j, t] >= (np.sum(self.x[i, j, t, :]) * 10e-5), bool))
-        # 8.time limitation constraint for each goods
+        #货物时间限制
         model.add_constraints(np.sum(arrTime[:, self.kEndPort[k], :, k]) <= self.kDDL[k] for k in range(self.goods)
                               if not isinstance(np.sum(arrTime[:, self.kEndPort[k], :, k]) <= self.kDDL[k], bool))
 
